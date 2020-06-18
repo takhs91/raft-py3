@@ -1,3 +1,4 @@
+import argparse
 import logging
 import random
 import threading
@@ -21,7 +22,11 @@ LEADER = "leader"
 
 
 class RaftServer(Service):
-    def __init__(self):
+    def __init__(self, id, peers):
+        # ID, peers
+        self.id = id
+        self.peers = peers
+
         # persistant state
         self.current_term = 0
         self.voted_for = None
@@ -155,6 +160,36 @@ class RaftServer(Service):
         return False
 
 
+def parse_raft_config(raft_config_filename):
+    nodes = {}
+    with open(raft_config_filename, 'r') as f:
+        for line in f:
+            node_name, params = line.split(':', maxsplit=1)
+            if not node_name.startswith('node'):
+                raise Exception('Invalid node name')
+            node_number = int(node_name[len('node'):])
+            hostname, port = params.strip().split(':', maxsplit=1)
+            logger.debug((node_number, hostname, port))
+            nodes[node_number] = {'hostname': hostname, 'port': int(port)}
+    return nodes
+
+nodes = None
+
 if __name__ == '__main__':
-    s = ThreadPoolServer(RaftServer(), port=18871)
+    # Setup argument parser
+    parser = argparse.ArgumentParser(description='Run a Raft node')
+    parser.add_argument('node_number', type=int,
+                        help='The number of node to run')
+    parser.add_argument('--config', nargs='?', default='raft_config.yaml')
+    args = parser.parse_args()
+    logger.debug(args)
+    # Parse nodes from configuration
+    nodes = parse_raft_config(args.config)
+    logger.debug(nodes)
+    if args.node_number not in nodes:
+        raise Exception('Node number does not exist in the configuration')
+    node = nodes[args.node_number]
+    nodes = nodes.pop(args.node_number)
+
+    s = ThreadPoolServer(RaftServer(id=args.node_number, peers=nodes), hostname=node['hostname'], port=node['port'])
     s.start()
