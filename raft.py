@@ -165,6 +165,8 @@ class RaftServer(Service):
                     self.current_term
                 )
             votes = 1
+            with self.lock:
+                self.voted_for = self.id
             async_results = {}
             sent_peers_set = set()
             while True:
@@ -205,6 +207,7 @@ class RaftServer(Service):
                         if term > self.current_term:
                             with self.lock:
                                 self.current_term = term
+                                self.voted_for = None
                             self.switch_state_to(FOLLOWER)
                             break
                         returned_results.append(peer_id)
@@ -261,6 +264,7 @@ class RaftServer(Service):
                         if term > self.current_term:
                             with self.lock:
                                 self.current_term = term
+                                self.voted_for = None
                             self.switch_state_to(FOLLOWER)
                             break
                 async_results = [result for result in async_results
@@ -276,14 +280,18 @@ class RaftServer(Service):
         with self.lock:
             if term < self.current_term:
                 return self.current_term, False
-            else:
+            elif self.voted_for is None or self.voted_for == candidate_id:
                 self.voted_for = candidate_id
+                vote_granted = True
+            else:
+                vote_granted = False
         if term > self.current_term:
             with self.lock:
                 self.current_term = term
+                self.voted_for = None
             self.switch_state_to(FOLLOWER)
         self.reset_event.set()
-        return term, True
+        return term, vote_granted
 
     def exposed_append_entries_rpc(self, term, leader_id):
         """Append Entries RPC
@@ -294,6 +302,8 @@ class RaftServer(Service):
                 return self.current_term, False
             else:
                 self.leader_id = leader_id
+        with self.lock:
+            self.voted_for = None
         self.switch_state_to(FOLLOWER)
         self.reset_event.set()
         self.candidate_timer_reset_event.set()
