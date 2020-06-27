@@ -165,39 +165,46 @@ class RaftServer(Service):
                     self.current_term
                 )
             votes = 1
-            # Setup RPC connections
-            for peer_id in self.peers:
-                if not self.peers[peer_id].conn:
-                    hostname = self.peers[peer_id].hostname
-                    port = self.peers[peer_id].port
-                    try:
-                        self.peers[peer_id].conn = rpyc.connect(hostname, port,
-                                                                keepalive=True)
-                    except ConnectionError:
-                        pass
-            async_results = []
-            # Send async RequestVoteRPC
-            for peer_id in self.peers:
-                conn = self.peers[peer_id].conn
-                if conn:
-                    try:
-                        request_vote_async = rpyc.async_(conn.root.request_vote_rpc)
-                        async_results.append(request_vote_async(self.current_term, self.id))
-                    except EOFError:
-                        self.peers[peer_id].conn = None
-
+            async_results = {}
+            sent_peers_set = set()
             while True:
                 if self.candidate_timer_expired_event.is_set():
                     break
+                # Setup RPC connections
+                for peer_id in self.peers:
+                    if not self.peers[peer_id].conn:
+                        hostname = self.peers[peer_id].hostname
+                        port = self.peers[peer_id].port
+                        try:
+                            self.peers[peer_id].conn = rpyc.connect(
+                                hostname, port,
+                                keepalive=True
+                            )
+                        except ConnectionError:
+                            pass
+                # Send async RequestVoteRPC
+                for peer_id in self.peers:
+                    conn = self.peers[peer_id].conn
+                    if conn:
+                        try:
+                            request_vote_async = rpyc.async_(
+                                conn.root.request_vote_rpc)
+                            if peer_id not in sent_peers_set:
+                                async_results[peer_id] = request_vote_async(
+                                    self.current_term, self.id)
+                                sent_peers_set.add(peer_id)
+                        except EOFError:
+                            self.peers[peer_id].conn = None
                 returned_results = []
-                for async_result in async_results:
+                for peer_id, async_result in async_results.items():
                     if async_result.ready:
-                        returned_results.append(async_result)
                         value = async_result.value
                         term, voted_granted = value
                         if voted_granted:
                             votes += 1
-                async_results = [result for result in async_results if result not in returned_results]
+                        returned_results.append(peer_id)
+                for peer_id in returned_results:
+                    async_results.pop(peer_id)
                 # If collected majority become leader
                 if votes >= len(self.peers) // 2 + 1:
                     logger.info("Thread %s: Switching to LEADER", name)
