@@ -85,7 +85,6 @@ class RaftServer(Service):
         )
         self.leader_loop.start()
 
-
     def switch_state_to(self, state):
         with self.lock:
             current_state = self.state
@@ -140,7 +139,8 @@ class RaftServer(Service):
             if not self.candidate_timer_reset_event.wait(timeout):
                 if self.stop_event.is_set():
                     break
-                logger.info("Thread %s: Timed out: Starting new election", name)
+                logger.info("Thread %s: Timed out: Starting new election",
+                            name)
                 self.candidate_timer_expired_event.set()
                 continue
 
@@ -202,6 +202,11 @@ class RaftServer(Service):
                         term, voted_granted = value
                         if voted_granted:
                             votes += 1
+                        if term > self.current_term:
+                            with self.lock:
+                                self.current_term = term
+                            self.switch_state_to(FOLLOWER)
+                            break
                         returned_results.append(peer_id)
                 for peer_id in returned_results:
                     async_results.pop(peer_id)
@@ -223,6 +228,7 @@ class RaftServer(Service):
                 logger.info("Thread %s: Not LEADER, will wait now..", name)
             self.leader_event.wait()
             logger.info("Thread %s: Became LEADER.", name)
+            async_results = []
             while True:
                 logger.info("Thread %s: Sending Heartbeats...", name)
                 # Setup RPC connections
@@ -231,20 +237,34 @@ class RaftServer(Service):
                         hostname = self.peers[peer_id].hostname
                         port = self.peers[peer_id].port
                         try:
-                            self.peers[peer_id].conn = rpyc.connect(hostname, port,
-                                                                    keepalive=True)
+                            self.peers[peer_id].conn = rpyc.connect(
+                                hostname, port, keepalive=True)
                         except ConnectionError:
                             pass
-                async_results = []
                 # Send async AppendEntriesRPC as heartbeats
                 for peer_id in self.peers:
                     conn = self.peers[peer_id].conn
                     if conn:
                         try:
-                            request_vote_async = rpyc.async_(conn.root.append_entries_rpc)
-                            async_results.append(request_vote_async(self.current_term, self.id))
+                            request_vote_async = rpyc.async_(
+                                conn.root.append_entries_rpc)
+                            async_results.append(request_vote_async(
+                                self.current_term, self.id))
                         except EOFError:
                             self.peers[peer_id].conn = None
+                returned_results = []
+                for async_result in async_results:
+                    if async_result.ready:
+                        returned_results.append(async_result)
+                        value = async_result.value
+                        term, success = value
+                        if term > self.current_term:
+                            with self.lock:
+                                self.current_term = term
+                            self.switch_state_to(FOLLOWER)
+                            break
+                async_results = [result for result in async_results
+                                 if result not in returned_results]
                 time.sleep(2)
 
     def exposed_request_vote_rpc(self, term, candidate_id):
