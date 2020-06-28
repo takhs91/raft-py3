@@ -274,39 +274,61 @@ class RaftServer(Service):
     def exposed_request_vote_rpc(self, term, candidate_id):
         """Request Votes RPC
         """
-        logger.info("Called the Request Votes RPC")
-        logger.info(term)
-        logger.info(self.current_term)
+        logger.info("RequestVoteRPC(term=%s, candidate_id=%s)",
+                    term, candidate_id)
+        logger.info("RequestVoteRPC[current_term=%s, voted_for=%s]",
+                    self.current_term, self.voted_for)
+
         with self.lock:
             if term < self.current_term:
+                logger.info("... RequestVoteRPC reply: %s",
+                            (self.current_term, False))
                 return self.current_term, False
-            elif self.voted_for is None or self.voted_for == candidate_id:
-                self.voted_for = candidate_id
-                vote_granted = True
-            else:
-                vote_granted = False
+
         if term > self.current_term:
+            logger.info(
+                "... RequestVoteRPC term out of date, switching to FOLLOWER")
             with self.lock:
                 self.current_term = term
                 self.voted_for = None
             self.switch_state_to(FOLLOWER)
+        with self.lock:
+            if self.voted_for is None or self.voted_for == candidate_id:
+                self.voted_for = candidate_id
+                vote_granted = True
+            else:
+                vote_granted = False
+
         self.reset_event.set()
+        logger.info("... RequestVoteRPC reply: %s",
+                    (term, vote_granted))
         return term, vote_granted
 
     def exposed_append_entries_rpc(self, term, leader_id):
         """Append Entries RPC
         """
-        logger.info("Called the Append Entries RPC")
+        logger.info("AppendEntriesRPC(term=%s, leader_id=%s)",
+                    term, leader_id)
+        logger.info("AppendEntriesRPC[current_term=%s]",
+                    self.current_term)
         with self.lock:
             if term < self.current_term:
+                logger.info("... AppendEntriesRPC reply: %s",
+                            (self.current_term, False))
                 return self.current_term, False
             else:
                 self.leader_id = leader_id
+        if term > self.current_term:
+            logger.info(
+                "... AppendEntriesRPC term out of date")
         with self.lock:
+            self.current_term = term
             self.voted_for = None
         self.switch_state_to(FOLLOWER)
         self.reset_event.set()
         self.candidate_timer_reset_event.set()
+        logger.info("... AppendEntriesRPC reply: %s",
+                    (term, True))
         return term, True
 
     def exposed_is_leader(self):
