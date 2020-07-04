@@ -29,6 +29,12 @@ class Peer:
         self.conn = None
 
 
+class LogEntry:
+    def __init__(self, command, term):
+        self.command = command
+        self.term = term
+
+
 class RaftServer(Service):
     def __init__(self, id, peers):
         # ID, peers
@@ -333,6 +339,17 @@ class RaftServer(Service):
 
     def exposed_is_leader(self):
         return False
+
+    def exposed_submit_rpc(self, command):
+        """Submit RPC
+        """
+        logger.info("SubmitRPC(command=%s)", command)
+        if self.state != LEADER:
+            logger.info("... SubmitRPC reply:%s", False)
+            return False
+        with self.lock:
+            self.log.append(LogEntry(command=command, term=self.current_term))
+        return True
 
 
 def parse_raft_config(raft_config_filename):
