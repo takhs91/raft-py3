@@ -39,10 +39,10 @@ class LogEntry:
 
 
 class AppendEntriesRPCResult:
-    def __init__(self, id, result, entries_len):
+    def __init__(self, id, result, new_next_index):
         self.id = id
         self.result = result
-        self.entries_len = entries_len
+        self.new_next_index = new_next_index
 
 
 class RaftServer(Service):
@@ -274,7 +274,7 @@ class RaftServer(Service):
                             if prev_log_index >= 0:
                                 prev_log_term = self.log[prev_log_index].term
                             entries = tuple((log.command, log.term) for log in self.log[self.next_index[peer_id]:])
-                            entries_len = len(entries)
+                            new_next_index = self.next_index[peer_id] + len(entries)
                         try:
                             request_vote_async = rpyc.async_(
                                 conn.root.append_entries_rpc)
@@ -300,7 +300,7 @@ class RaftServer(Service):
                                 AppendEntriesRPCResult(
                                     id=peer_id,
                                     result=async_result,
-                                    entries_len=entries_len
+                                    new_next_index=new_next_index
                                 )
                             )
                         except EOFError:
@@ -319,11 +319,11 @@ class RaftServer(Service):
                             break
                         if success:
                             with self.lock:
-                                print("async_result.entries_len")
-                                print(async_result.entries_len)
+                                print("async_result.new_next_index")
+                                print(async_result.new_next_index)
                                 print("self.next_index[async_result.id]")
                                 print(self.next_index[async_result.id])
-                                self.next_index[async_result.id] += async_result.entries_len
+                                self.next_index[async_result.id] = max(async_result.new_next_index, self.next_index[async_result.id])
                                 self.match_index[async_result.id] = self.next_index[async_result.id] - 1
                                 logger.info(
                                     "Append entries from %s succeded, next index: %s, match index: %s",
