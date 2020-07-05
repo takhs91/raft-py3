@@ -205,11 +205,20 @@ class RaftServer(Service):
                     conn = self.peers[peer_id].conn
                     if conn:
                         try:
+                            with self.lock:
+                                last_log_index = len(self.log) - 1
+                                las_log_term = -1
+                                if last_log_index != -1:
+                                    las_log_term = self.log[last_log_index].term
                             request_vote_async = rpyc.async_(
                                 conn.root.request_vote_rpc)
                             if peer_id not in sent_peers_set:
                                 async_results[peer_id] = request_vote_async(
-                                    self.current_term, self.id)
+                                    self.current_term,
+                                    self.id,
+                                    last_log_index,
+                                    las_log_term,
+                                    )
                                 sent_peers_set.add(peer_id)
                         except EOFError:
                             self.peers[peer_id].conn = None
@@ -319,11 +328,10 @@ class RaftServer(Service):
                             break
                         if success:
                             with self.lock:
-                                print("async_result.new_next_index")
-                                print(async_result.new_next_index)
-                                print("self.next_index[async_result.id]")
-                                print(self.next_index[async_result.id])
-                                self.next_index[async_result.id] = max(async_result.new_next_index, self.next_index[async_result.id])
+                                self.next_index[async_result.id] = max(
+                                    async_result.new_next_index,
+                                    self.next_index[async_result.id]
+                                )
                                 self.match_index[async_result.id] = self.next_index[async_result.id] - 1
                                 logger.info(
                                     "Append entries from %s succeded, next index: %s, match index: %s",
@@ -357,13 +365,27 @@ class RaftServer(Service):
                                  if result not in returned_results]
                 time.sleep(2)
 
-    def exposed_request_vote_rpc(self, term, candidate_id):
+    def exposed_request_vote_rpc(self, term, candidate_id, last_log_index,
+                                 last_log_term):
         """Request Votes RPC
         """
-        logger.info("RequestVoteRPC(term=%s, candidate_id=%s)",
-                    term, candidate_id)
-        logger.info("RequestVoteRPC[current_term=%s, voted_for=%s]",
-                    self.current_term, self.voted_for)
+        logger.info(
+            "RequestVoteRPC(term=%s, candidate_id=%s, last_log_index=%s, "
+            "last_log_term=%s)",
+            term, candidate_id, last_log_index, last_log_term)
+        with self.lock:
+            last_log_index_local = len(self.log) - 1
+            las_log_term_local = -1
+            if last_log_index_local != -1:
+                las_log_term_local = self.log[last_log_index_local].term
+        logger.info(
+            "RequestVoteRPC[current_term=%s, voted_for=%s, "
+            "last_log_index_local=%s, las_log_term_local=%s]",
+            self.current_term,
+            self.voted_for,
+            last_log_index_local,
+            las_log_term_local
+        )
 
         with self.lock:
             if term < self.current_term:
@@ -379,7 +401,18 @@ class RaftServer(Service):
                 self.voted_for = None
             self.switch_state_to(FOLLOWER)
         with self.lock:
-            if self.voted_for is None or self.voted_for == candidate_id:
+            # Vote if haven't voted or voted the same already
+            # and if candidate is as up-to-date 
+            if (
+                (self.voted_for is None or self.voted_for == candidate_id)
+                and (
+                    last_log_term > las_log_term_local
+                    or (
+                        last_log_term == las_log_term_local
+                        and last_log_index >= last_log_index_local
+                    )
+                )
+            ):
                 self.voted_for = candidate_id
                 vote_granted = True
             else:
