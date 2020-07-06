@@ -4,6 +4,7 @@ import random
 import rpyc
 import threading
 import time
+import json
 
 from rpyc import Service
 from rpyc.utils.server import ThreadPoolServer
@@ -37,6 +38,9 @@ class LogEntry:
     def __repr__(self):
         return "LogEntry[command: %s, term: %s]" % (self.command, self.term)
 
+    def as_dict(self):
+        return {'command': self.command,  'term': self.term}
+
 
 class AppendEntriesRPCResult:
     def __init__(self, id, result, new_next_index):
@@ -56,6 +60,8 @@ class RaftServer(Service):
         self.current_term = 0
         self.voted_for = None
         self.log = []
+        # load state from stable storage
+        self.load_state()
         # Volatile state All
         self.commit_index = -1
         self.last_applied = -1
@@ -100,6 +106,27 @@ class RaftServer(Service):
             daemon=True,
         )
         self.leader_loop.start()
+
+    def persist_state(self):
+        """Call wih lock taken
+        """
+        state = {
+            "current_term": self.current_term,
+            "voted_for": self.voted_for,
+            "log": [log.as_dict() for log in self.log]
+        }
+        with open(str(self.id) + "_log.json", 'w') as f:
+            json.dump(state, f)
+
+    def load_state(self):
+        try:
+            with open(str(self.id) + "_log.json", 'r+') as f:
+                state = json.load(f)
+            self.current_term = state["current_term"]
+            self.voted_for = state["voted_for"]
+            self.log = [LogEntry(log["command"], log["term"]) for log in state["log"]]
+        except FileNotFoundError:
+            pass
 
     def switch_state_to(self, state):
         with self.lock:
@@ -421,6 +448,8 @@ class RaftServer(Service):
         self.reset_event.set()
         logger.info("... RequestVoteRPC reply: %s",
                     (term, vote_granted))
+        with self.lock:
+            self.persist_state()
         return term, vote_granted
 
     def exposed_append_entries_rpc(self, term, leader_id, prev_log_index,
@@ -517,6 +546,8 @@ class RaftServer(Service):
                     )
         logger.info("... AppendEntriesRPC reply: %s",
                     (term, success))
+        with self.lock:
+            self.persist_state()
         return term, success
 
     def exposed_is_leader(self):
@@ -531,6 +562,7 @@ class RaftServer(Service):
             return False
         with self.lock:
             self.log.append(LogEntry(command=command, term=self.current_term))
+            self.persist_state()
         return True
 
 
