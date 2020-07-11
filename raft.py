@@ -4,6 +4,7 @@ import random
 import rpyc
 import threading
 import time
+import json
 
 from rpyc import Service
 from rpyc.utils.server import ThreadPoolServer
@@ -29,6 +30,25 @@ class Peer:
         self.conn = None
 
 
+class LogEntry:
+    def __init__(self, command, term):
+        self.command = command
+        self.term = term
+
+    def __repr__(self):
+        return "LogEntry[command: %s, term: %s]" % (self.command, self.term)
+
+    def as_dict(self):
+        return {'command': self.command,  'term': self.term}
+
+
+class AppendEntriesRPCResult:
+    def __init__(self, id, result, new_next_index):
+        self.id = id
+        self.result = result
+        self.new_next_index = new_next_index
+
+
 class RaftServer(Service):
     def __init__(self, id, peers):
         # ID, peers
@@ -40,12 +60,14 @@ class RaftServer(Service):
         self.current_term = 0
         self.voted_for = None
         self.log = []
+        # load state from stable storage
+        self.load_state()
         # Volatile state All
-        self.commit_index = 0
-        self.last_applied = 0
+        self.commit_index = -1
+        self.last_applied = -1
         # Volatile state Leader
-        self.next_index = []
-        self.match_index = []
+        self.next_index = {}
+        self.match_index = {}
         # Current state
         self.state = FOLLOWER
         self.lock = threading.Lock()
@@ -84,6 +106,27 @@ class RaftServer(Service):
             daemon=True,
         )
         self.leader_loop.start()
+
+    def persist_state(self):
+        """Call wih lock taken
+        """
+        state = {
+            "current_term": self.current_term,
+            "voted_for": self.voted_for,
+            "log": [log.as_dict() for log in self.log]
+        }
+        with open(str(self.id) + "_log.json", 'w') as f:
+            json.dump(state, f)
+
+    def load_state(self):
+        try:
+            with open(str(self.id) + "_log.json", 'r+') as f:
+                state = json.load(f)
+            self.current_term = state["current_term"]
+            self.voted_for = state["voted_for"]
+            self.log = [LogEntry(log["command"], log["term"]) for log in state["log"]]
+        except FileNotFoundError:
+            pass
 
     def switch_state_to(self, state):
         with self.lock:
@@ -189,11 +232,20 @@ class RaftServer(Service):
                     conn = self.peers[peer_id].conn
                     if conn:
                         try:
+                            with self.lock:
+                                last_log_index = len(self.log) - 1
+                                las_log_term = -1
+                                if last_log_index != -1:
+                                    las_log_term = self.log[last_log_index].term
                             request_vote_async = rpyc.async_(
                                 conn.root.request_vote_rpc)
                             if peer_id not in sent_peers_set:
                                 async_results[peer_id] = request_vote_async(
-                                    self.current_term, self.id)
+                                    self.current_term,
+                                    self.id,
+                                    last_log_index,
+                                    las_log_term,
+                                    )
                                 sent_peers_set.add(peer_id)
                         except EOFError:
                             self.peers[peer_id].conn = None
@@ -231,6 +283,10 @@ class RaftServer(Service):
                 logger.info("Thread %s: Not LEADER, will wait now..", name)
             self.leader_event.wait()
             logger.info("Thread %s: Became LEADER.", name)
+            with self.lock:
+                for peer_id in self.peers:
+                    self.next_index[peer_id] = len(self.log)
+                    self.match_index[peer_id] = -1
             async_results = []
             while True:
                 logger.info("Thread %s: Sending Heartbeats...", name)
@@ -248,18 +304,48 @@ class RaftServer(Service):
                 for peer_id in self.peers:
                     conn = self.peers[peer_id].conn
                     if conn:
+                        with self.lock:
+                            prev_log_index = self.next_index[peer_id] - 1
+                            prev_log_term = -1
+                            if prev_log_index >= 0:
+                                prev_log_term = self.log[prev_log_index].term
+                            entries = tuple((log.command, log.term) for log in self.log[self.next_index[peer_id]:])
+                            new_next_index = self.next_index[peer_id] + len(entries)
                         try:
                             request_vote_async = rpyc.async_(
                                 conn.root.append_entries_rpc)
-                            async_results.append(request_vote_async(
-                                self.current_term, self.id))
+                            async_result = request_vote_async(
+                                    self.current_term,
+                                    self.id,
+                                    prev_log_index,
+                                    prev_log_term,
+                                    entries,
+                                    self.commit_index
+                                )
+                            logger.info(
+                                "Sending AppendEntriesRPC(term=%s, leader_id=%s, prev_log_index=%s, "
+                                "prev_log_term=%s, entries=%s, leader_commit=%s)",
+                                self.current_term,
+                                self.id,
+                                prev_log_index,
+                                prev_log_term,
+                                entries,
+                                self.commit_index
+                            )
+                            async_results.append(
+                                AppendEntriesRPCResult(
+                                    id=peer_id,
+                                    result=async_result,
+                                    new_next_index=new_next_index
+                                )
+                            )
                         except EOFError:
                             self.peers[peer_id].conn = None
                 returned_results = []
                 for async_result in async_results:
-                    if async_result.ready:
+                    if async_result.result.ready:
                         returned_results.append(async_result)
-                        value = async_result.value
+                        value = async_result.result.value
                         term, success = value
                         if term > self.current_term:
                             with self.lock:
@@ -267,17 +353,66 @@ class RaftServer(Service):
                                 self.voted_for = None
                             self.switch_state_to(FOLLOWER)
                             break
+                        if success:
+                            with self.lock:
+                                self.next_index[async_result.id] = max(
+                                    async_result.new_next_index,
+                                    self.next_index[async_result.id]
+                                )
+                                self.match_index[async_result.id] = self.next_index[async_result.id] - 1
+                                logger.info(
+                                    "Append entries from %s succeded, next index: %s, match index: %s",
+                                    async_result.id,
+                                    self.next_index[async_result.id],
+                                    self.match_index[async_result.id]
+                                )
+                                saved_commit_index = self.commit_index
+                                for n in range(self.commit_index + 1, len(self.log)):
+                                    if self.log[n].term == self.current_term:
+                                        replicated_count = 1
+                                        for peer_id in self.peers:
+                                            if self.match_index[peer_id] >= n:
+                                                replicated_count += 1
+                                        if replicated_count >= len(self.peers) // 2 + 1:
+                                            self.commit_index = n
+                                if saved_commit_index != self.commit_index:
+                                    logger.info(
+                                        "Leader commit index is updated to %s",
+                                        self.commit_index
+                                    )
+                        else:
+                            with self.lock:
+                                self.next_index[async_result.id] -= 1
+                                logger.info(
+                                    "Append entries from %s failed, next index %s",
+                                    async_result.id,
+                                    self.next_index[async_result.id]
+                                )
                 async_results = [result for result in async_results
                                  if result not in returned_results]
                 time.sleep(2)
 
-    def exposed_request_vote_rpc(self, term, candidate_id):
+    def exposed_request_vote_rpc(self, term, candidate_id, last_log_index,
+                                 last_log_term):
         """Request Votes RPC
         """
-        logger.info("RequestVoteRPC(term=%s, candidate_id=%s)",
-                    term, candidate_id)
-        logger.info("RequestVoteRPC[current_term=%s, voted_for=%s]",
-                    self.current_term, self.voted_for)
+        logger.info(
+            "RequestVoteRPC(term=%s, candidate_id=%s, last_log_index=%s, "
+            "last_log_term=%s)",
+            term, candidate_id, last_log_index, last_log_term)
+        with self.lock:
+            last_log_index_local = len(self.log) - 1
+            las_log_term_local = -1
+            if last_log_index_local != -1:
+                las_log_term_local = self.log[last_log_index_local].term
+        logger.info(
+            "RequestVoteRPC[current_term=%s, voted_for=%s, "
+            "last_log_index_local=%s, las_log_term_local=%s]",
+            self.current_term,
+            self.voted_for,
+            last_log_index_local,
+            las_log_term_local
+        )
 
         with self.lock:
             if term < self.current_term:
@@ -293,7 +428,18 @@ class RaftServer(Service):
                 self.voted_for = None
             self.switch_state_to(FOLLOWER)
         with self.lock:
-            if self.voted_for is None or self.voted_for == candidate_id:
+            # Vote if haven't voted or voted the same already
+            # and if candidate is as up-to-date 
+            if (
+                (self.voted_for is None or self.voted_for == candidate_id)
+                and (
+                    last_log_term > las_log_term_local
+                    or (
+                        last_log_term == las_log_term_local
+                        and last_log_index >= last_log_index_local
+                    )
+                )
+            ):
                 self.voted_for = candidate_id
                 vote_granted = True
             else:
@@ -302,15 +448,35 @@ class RaftServer(Service):
         self.reset_event.set()
         logger.info("... RequestVoteRPC reply: %s",
                     (term, vote_granted))
+        with self.lock:
+            self.persist_state()
         return term, vote_granted
 
-    def exposed_append_entries_rpc(self, term, leader_id):
+    def exposed_append_entries_rpc(self, term, leader_id, prev_log_index,
+                                   prev_log_term, entries, leader_commit):
         """Append Entries RPC
+
+        term: leader's term
+        leader_id: so follower can redirect clients
+        prev_log_index: index of log entry immediately preceding new ones
+        prev_log_term: term of prevLogIndex entry
+        entries: log entries to store (empty for heartbeat; may send more than
+            one for efficiency)
+        leader_commit: leader’s commitIndex
         """
-        logger.info("AppendEntriesRPC(term=%s, leader_id=%s)",
-                    term, leader_id)
+        logger.info(
+            "AppendEntriesRPC(term=%s, leader_id=%s, prev_log_index=%s, "
+            "prev_log_term=%s, entries=%s, leader_commit=%s)",
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit
+        )
         logger.info("AppendEntriesRPC[current_term=%s]",
                     self.current_term)
+        entries = tuple(LogEntry(entry[0], entry[1]) for entry in entries)
         with self.lock:
             if term < self.current_term:
                 logger.info("... AppendEntriesRPC reply: %s",
@@ -327,12 +493,77 @@ class RaftServer(Service):
         self.switch_state_to(FOLLOWER)
         self.reset_event.set()
         self.candidate_timer_reset_event.set()
+
+        # Log replication logic
+        success = False
+        # check if log contain an entry at prev_log_index whose term
+        # matches prev_log_term. If prev_log_index = -1 it matches
+        with self.lock:
+            if (
+                (prev_log_index == -1) or
+                (
+                    prev_log_index < len(self.log) and
+                    prev_log_term == self.log[prev_log_index].term
+                )
+            ):
+                success = True
+        # Append new entries not already in log
+        # If an existing entry conflicts with a new one
+        # (same index but different terms), delete the existing entry and all
+        # that follow it
+        if success:
+            with self.lock:
+                logger.info(
+                    "... AppendEntriesRPC Inserting entries to log"
+                )
+                logger.info(
+                    "... AppendEntriesRPC Current log: %s",
+                    self.log
+                )
+                i = prev_log_index + 1
+                for entry in entries:
+                    # if log has already entries at
+                    # index i
+                    if i < len(self.log):
+                        # if conflict delete existing entry and all that follow
+                        if self.log[i] != entry:
+                            self.log = self.log[:i]
+                            self.log.append(entry)
+                        # else same entry do nothing
+                    else:
+                        self.log.append(entry)
+                    i = i + 1
+                logger.info(
+                    "... AppendEntriesRPC Updated log: %s",
+                    self.log
+                )
+            # Update commit index
+                if leader_commit > self.commit_index:
+                    self.commit_index = min(leader_commit, len(self.log) - 1)
+                    logger.info(
+                        "... AppendEntriesRPC Updated commit index: %s",
+                        self.commit_index
+                    )
         logger.info("... AppendEntriesRPC reply: %s",
-                    (term, True))
-        return term, True
+                    (term, success))
+        with self.lock:
+            self.persist_state()
+        return term, success
 
     def exposed_is_leader(self):
         return False
+
+    def exposed_submit_rpc(self, command):
+        """Submit RPC
+        """
+        logger.info("SubmitRPC(command=%s)", command)
+        if self.state != LEADER:
+            logger.info("... SubmitRPC reply:%s", False)
+            return False
+        with self.lock:
+            self.log.append(LogEntry(command=command, term=self.current_term))
+            self.persist_state()
+        return True
 
 
 def parse_raft_config(raft_config_filename):
