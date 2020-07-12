@@ -551,7 +551,7 @@ class RaftServer(Service):
         return term, success
 
     def exposed_is_leader(self):
-        return False
+        return self.state == LEADER
 
     def exposed_submit_rpc(self, command):
         """Submit RPC
