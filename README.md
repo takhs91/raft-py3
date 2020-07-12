@@ -22,3 +22,9 @@ python raft.py 0
 ```
 python client.py 0
 ```
+
+To run tests
+```
+pip install pytest
+pytest
+```
