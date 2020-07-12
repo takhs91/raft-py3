@@ -59,7 +59,7 @@ Any methods starting with `exposed_` will be exposed as RPC, in our case they ar
 
 The service is exposed using a [ThreadPoolServer](https://rpyc.readthedocs.io/en/latest/api/utils_server.html#rpyc.utils.server.ThreadPoolServer) that means its rpc request will be handled by one of the threads available in the ThreadPool.
 
-Except the threads owned byt the ThreadPoolServer to serve incoming rpc calls the `RaftServer` on its constructor start starts 4 more threads
+Except from the threads owned by the ThreadPoolServer to serve incoming rpc calls the `RaftServer` on its constructor starts 4 more threads
 that run the following functions
 
 1. `election_timeout` which is the function running the timer that will make a FOLLOWER switch to candidate
@@ -83,8 +83,8 @@ the same loop utilizing the asyncronous operation of RPyC as described [here](ht
 The requests are issued in a first loop for all the nodes and the "AsyncResult" are saved in an appropriated data structure.
 A second loop is responsible for checking if any of the results are ready and do the appropriate actions.
 
-One more thing that would have to be improved its the fact that the leader sends AppendEntriesRPC in fixed intervals only.
-This could be optimized in a way to send AppendEntriesRPC needed to serve a client request immidiately and also send some on fixed
+One more thing that would have to be improved is the fact that the leader sends AppendEntriesRPC in fixed intervals only.
+This could be optimized in a way to send AppendEntriesRPC needed to serve a client request immediately and also send some on fixed
 intervals or using a timer based logic (if haven't sent any for x time then send some).
 
 Also as stated in the timeline section the commands are currently dummy and there is no state machine. Furthemore the client rpc returns
