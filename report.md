@@ -34,15 +34,17 @@ different numbers of nodes or failures, network partitions etc.
 9. I then implemented the Log replication section and the election restriction. I had to fill all the things I skiped before. I also implemeted a simple RPC for accepting client requests. The requests are dummy (contain no actual commands) and thus are also not appied to a a state machine. Also my simple client sbmit rpc returns before the command is commited. Making this to block till command is commited shouldn't be very difficult to implement
 10. I spent a lot time debugging and testing on those
 11. Finally I implemented the state peristance part
+12. I also wrote two automated tests for leader election
 
 
 ### Completed tasks
 * The basic Raft algorithm is implemented
-* After extensive manual testing I believe its correct
+* After extensive manual testing and two automated tests I believe its correct
 * The implemention is possible to run in either one or multiple machines
+* Two automated tests for leader election
 
 ### Unfinished tasks
-* Automated tests
+* No automated tests for log replication
 * Measurments
 * Real commands and state machine
 
@@ -93,8 +95,9 @@ The state is saved to JSON using the `persist_state` and `load_state` methods
 
 # Evaluation
 Manual testing of various scenarios mostly related to node crashes was done
+Also two automated tests for leader election were developed
 
-Example test for leader election using 5 nodes:
+Example test for leader election using 5 nodes that is also automated:
 1. Start the first node, its timer will expire and become a candidate
 2. Start a second node, they cannot elect a leader
 3. Start a third node, after a while a leader is elected
@@ -119,4 +122,4 @@ Test for log replication with log conflicts
 5. Restart the previously 3 crashed nodes
 6. Send some request to the new leader, the will be replicated and commited
 7. Restart the previsously 2 crashed nodes
-8. The leader will replace their uncommited logs that conflict with the leaer log
+8. The leader will replace their uncommited logs that conflict with the leader log
